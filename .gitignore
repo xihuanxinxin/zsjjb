@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+*.egg-info/
+.eggs/
+dist/
+build/
+*.spec.bak
+
+# 本程序缓存与中间输出
+excel_normalize_cache/
+_normalize_out/
+
+# 本地 / IDE
+.idea/
+.vscode/
+*.swp
+Thumbs.db
+.DS_Store
+
+# 可选：若不想把业务数据进仓库，取消下面注释
+# *.csv
+# *.xlsx

@@ -1,28 +1,65 @@
-# Python
+# ---------- Python 字节码与构建 ----------
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 .Python
-.venv/
-venv/
 *.egg-info/
 .eggs/
 dist/
 build/
 *.spec.bak
 
-# 本程序缓存与中间输出
-excel_normalize_cache/
-_normalize_out/
+# ---------- 虚拟环境（勿提交）----------
+.venv/
+venv/
+env/
+ENV/
+.virtualenv/
+virtualenv/
+.pyenv/
 
-# 本地 / IDE
+# pip / 工具缓存
+.pip/
+pip-wheel-metadata/
+
+# Poetry / PDM（若未用可忽略；有项目时按需删掉对应行）
+# .venv 已覆盖多数情况
+.poetry/
+
+# ---------- 本地配置与密钥（勿提交）----------
+.env
+.env.*
+!.env.example
+*.local
+*.local.*
+secrets/
+.secrets/
+credentials.json
+*credentials*.json
+*.pem
+id_rsa
+id_rsa.pub
+*.key
+config.local.*
+settings.local.json
+
+# ---------- IDE / 编辑器（个人配置勿提交）----------
 .idea/
 .vscode/
 *.swp
+*.swo
+*~
+
+# ---------- 系统杂项 ----------
 Thumbs.db
 .DS_Store
+desktop.ini
 
-# 可选：若不想把业务数据进仓库，取消下面注释
+# ---------- 本程序缓存与中间输出 ----------
+excel_normalize_cache/
+_normalize_out/
+
+# ---------- 可选：业务数据（需要时取消注释）----------
 # *.csv
 # *.xlsx

@@ -4,6 +4,7 @@ import json
 import os
 import re
 import sys
+import calendar
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 import pandas as pd
@@ -38,6 +39,8 @@ class DatabaseAssetGUI:
         self._norm_formulas_only_mode = False
         self._norm_per_sheet_calc: list = []  # [(sheet_name, df公式后含可选「数据块」列), ...]
         self._last_excel_grid_cache_dir = ""
+        self.var_bill_year = tk.IntVar(value=2026)
+        self.var_bill_month = tk.IntVar(value=4)
         self.create_widgets()
         self.refresh_table()
         self.root.after(200, self._init_assets_paned_sash)
@@ -229,6 +232,31 @@ class DatabaseAssetGUI:
 
         lf_calc = ttk.LabelFrame(body, text="计费计算（可逐项执行或一键完成）", padding=(8, 8))
         lf_calc.pack(fill=tk.X, pady=(0, 6))
+
+        bill_row = ttk.Frame(lf_calc)
+        bill_row.pack(fill=tk.X, pady=(0, 6))
+        ttk.Label(bill_row, text="账单月：").pack(side=tk.LEFT, padx=(0, 4))
+        tk.Spinbox(
+            bill_row,
+            from_=2020,
+            to=2035,
+            width=6,
+            textvariable=self.var_bill_year,
+        ).pack(side=tk.LEFT)
+        ttk.Label(bill_row, text="年").pack(side=tk.LEFT, padx=(2, 6))
+        tk.Spinbox(
+            bill_row,
+            from_=1,
+            to=12,
+            width=4,
+            textvariable=self.var_bill_month,
+        ).pack(side=tk.LEFT)
+        ttk.Label(bill_row, text="月").pack(side=tk.LEFT, padx=(2, 8))
+        ttk.Label(
+            bill_row,
+            text="（清洗 Excel 时从文件名「YYYY年M月」自动识别；影响本期计费起止与天数）",
+            style="Sub.TLabel",
+        ).pack(side=tk.LEFT)
 
         calc_grid = ttk.Frame(lf_calc)
         calc_grid.pack(fill=tk.X)
@@ -980,6 +1008,54 @@ class DatabaseAssetGUI:
             messagebox.showinfo("成功", f"已成功删除 {delete_count} 条记录")
             self.refresh_table()
     
+    @staticmethod
+    def parse_bill_month_from_filename(filename: str) -> tuple[int, int] | None:
+        """从供应商表文件名解析账单月，如「2026年4月-安恒开通…」→ (2026, 4)。"""
+        if not filename:
+            return None
+        m = re.search(r"(\d{4})年(\d{1,2})月", str(filename))
+        if not m:
+            return None
+        y, mo = int(m.group(1)), int(m.group(2))
+        if 2000 <= y <= 2100 and 1 <= mo <= 12:
+            return y, mo
+        return None
+
+    def _bill_month_bounds(self) -> tuple[date, date]:
+        """账单月首末日（自然月）。"""
+        y = int(self.var_bill_year.get())
+        mo = int(self.var_bill_month.get())
+        mo = max(1, min(12, mo))
+        last = calendar.monthrange(y, mo)[1]
+        return date(y, mo, 1), date(y, mo, last)
+
+    @staticmethod
+    def _parse_datetime_cell(val) -> datetime | None:
+        """解析单元格日期时间为 datetime（日初）。"""
+        if val is None or (isinstance(val, float) and pd.isna(val)):
+            return None
+        s0 = str(val).strip()
+        if not s0 or s0 == "!" or s0.lower() in ("nan", "none", "nat"):
+            return None
+        if len(s0) >= 10 and s0[4] in "-/" and s0[7] in "-/":
+            s0 = s0[:10].replace("-", "/")
+        for fmt in ("%Y/%m/%d", "%Y-%m-%d", "%Y年%m月%d日"):
+            try:
+                return datetime.strptime(s0[:10], fmt)
+            except ValueError:
+                continue
+        try:
+            return datetime.strptime(s0, "%Y年%m月%d日")
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _inclusive_days(d1: date, d2: date) -> int:
+        """含首尾日的日历天数；d1>d2 时为 0。"""
+        if d1 > d2:
+            return 0
+        return (d2 - d1).days + 1
+
     def calculate_billing_start(self, show_message=True, persist=True):
         """计算所有记录的计费开始时间（开通时间+90天）"""
         if len(self.data_manager.data) == 0:
@@ -1002,44 +1078,30 @@ class DatabaseAssetGUI:
             messagebox.showinfo("成功", f"已计算 {count} 条记录的计费开始时间")
 
     def calculate_current_period_start(self, show_message=True, persist=True):
-        """计算本期计费开始时间"""
+        """本期计费开始时间：账单月首日，或开通落在本月时取开通日（与清单一致）。"""
         if len(self.data_manager.data) == 0:
             if show_message:
                 messagebox.showinfo("提示", "当前没有数据")
             return
-        
-        april_start = datetime(2026, 4, 1)
-        april_end = datetime(2026, 4, 30)
-        
+
+        month_start, month_end = self._bill_month_bounds()
+        month_start_dt = datetime.combine(month_start, datetime.min.time())
+        month_end_dt = datetime.combine(month_end, datetime.min.time())
+
         count = 0
         for index, row in self.data_manager.data.iterrows():
-            open_date = row['开通时间']
-            
-            # 解析开通时间
-            open_dt = None
-            if open_date:
-                for fmt in ['%Y/%m/%d', '%Y-%m-%d', '%Y年%m月%d日']:
-                    try:
-                        open_dt = datetime.strptime(str(open_date), fmt)
-                        break
-                    except:
-                        continue
-            
-            # 计算本期计费开始时间
-            current_period_start = ''
+            open_dt = self._parse_datetime_cell(row.get("开通时间"))
+            current_period_start = ""
             if open_dt:
-                if april_start <= open_dt <= april_end:
-                    # 开通时间在2026/04/01和2026/04/30之间
-                    current_period_start = open_dt.strftime('%Y/%m/%d')
-                elif open_dt < april_start:
-                    # 开通时间早于2026/04/01，本期计费开始时间为2026/04/01
-                    current_period_start = '2026/04/01'
-                # 开通时间晚于2026/04/30，保持为空
-            
+                if month_start_dt <= open_dt <= month_end_dt:
+                    current_period_start = open_dt.strftime("%Y/%m/%d")
+                elif open_dt < month_start_dt:
+                    current_period_start = month_start.strftime("%Y/%m/%d")
+
             if current_period_start:
-                self.data_manager.data.loc[index, '本期计费开始时间'] = current_period_start
+                self.data_manager.data.loc[index, "本期计费开始时间"] = current_period_start
                 count += 1
-        
+
         if persist:
             self.data_manager.save_data()
             self.refresh_table()
@@ -1047,64 +1109,57 @@ class DatabaseAssetGUI:
             messagebox.showinfo("成功", f"已计算 {count} 条记录的本期计费开始时间")
 
     def calculate_current_period_end(self, show_message=True, persist=True):
-        """计算本期计费结束时间"""
+        """本期计费截至日期：无关停 → 计至账单月最后一天（整月）；本月内关停 → 关停前一日；关停早于账单月 → 空。"""
         if len(self.data_manager.data) == 0:
             if show_message:
                 messagebox.showinfo("提示", "当前没有数据")
             return
-        
-        april_start = datetime(2026, 4, 1)
-        april_end = datetime(2026, 4, 30)
-        
+
+        month_start, month_end = self._bill_month_bounds()
+
         count = 0
         for index, row in self.data_manager.data.iterrows():
-            shutdown_date = row['关停时间']
-            current_period_start_date = row['本期计费开始时间']
-            
-            # 解析关停时间
-            shutdown_dt = None
-            if shutdown_date:
-                for fmt in ['%Y/%m/%d', '%Y-%m-%d', '%Y年%m月%d日']:
-                    try:
-                        shutdown_dt = datetime.strptime(str(shutdown_date), fmt)
-                        break
-                    except:
-                        continue
-            
-            # 解析本期计费开始时间
-            period_start_dt = None
-            if current_period_start_date:
-                for fmt in ['%Y/%m/%d', '%Y-%m-%d', '%Y年%m月%d日']:
-                    try:
-                        period_start_dt = datetime.strptime(str(current_period_start_date), fmt)
-                        break
-                    except:
-                        continue
-            
-            # 计算本期计费截至日期（关停当日通常不计费，取关停日前一日为「计至」）
-            current_period_end = ''
+            shutdown_dt = self._parse_datetime_cell(row.get("关停时间"))
+            period_start_dt = self._parse_datetime_cell(row.get("本期计费开始时间"))
+            open_dt = self._parse_datetime_cell(row.get("开通时间"))
+
+            current_period_end = ""
+
+            def _open_in_bill_month() -> bool:
+                """与「本期计费开始」一致：开通早于月初或落在本月内，且未晚于月末（本月有计费段）。"""
+                if not open_dt:
+                    return False
+                od = open_dt.date()
+                return od <= month_end and (od < month_start or month_start <= od <= month_end)
+
             if shutdown_dt:
-                if shutdown_dt < april_start:
-                    # 关停时间早于2026/04/01，本期计费截至日期为空
-                    current_period_end = ''
-                elif april_start <= shutdown_dt <= april_end:
-                    # 关停落在 4 月：计费截到关停前一日（与清单「关停 4/14、计费截至 4/13」一致）
-                    last_bill = shutdown_dt - timedelta(days=1)
-                    if last_bill.date() < april_start.date():
+                sd = shutdown_dt.date()
+                if sd < month_start:
+                    current_period_end = ""
+                elif month_start <= sd <= month_end:
+                    last_bill = sd - timedelta(days=1)
+                    if last_bill < month_start:
                         current_period_end = ""
                     else:
                         current_period_end = last_bill.strftime("%Y/%m/%d")
                 else:
-                    # 关停时间晚于2026/04/30，填写惊叹号标识错误
-                    current_period_end = '!'
-            elif period_start_dt and april_start <= period_start_dt <= april_end:
-                # 没有关停时间，但本期计费开始时间在2026/04/01和2026/04/30之间
-                current_period_end = '2026/04/30'
-            
-            # 更新数据（包括清空的情况）
-            self.data_manager.data.loc[index, '本期计费截至日期'] = current_period_end
+                    # 关停晚于本月：仍在用的服务，本月计至月末
+                    if period_start_dt and month_start <= period_start_dt.date() <= month_end:
+                        current_period_end = month_end.strftime("%Y/%m/%d")
+                    elif _open_in_bill_month():
+                        current_period_end = month_end.strftime("%Y/%m/%d")
+                    else:
+                        current_period_end = ""
+            else:
+                # 无关停：整月计至月末（与「半路关停」截到关停前一日相对）
+                if period_start_dt and month_start <= period_start_dt.date() <= month_end:
+                    current_period_end = month_end.strftime("%Y/%m/%d")
+                elif _open_in_bill_month():
+                    current_period_end = month_end.strftime("%Y/%m/%d")
+
+            self.data_manager.data.loc[index, "本期计费截至日期"] = current_period_end
             count += 1
-        
+
         if persist:
             self.data_manager.save_data()
             self.refresh_table()
@@ -1166,14 +1221,17 @@ class DatabaseAssetGUI:
             messagebox.showinfo("成功", f"已计算 {count} 条记录的本月核算金额")
 
     def calculate_total_billing_days(self, show_message=True, persist=True):
-        """规范标准列「应计费天数」为整数显示；不以「本月核算天数」回填。
+        """推算「应计费天数」并写回标准列（与供应商「截至…月…日应计费天数」合并列一致）。
 
-        应计费天数以供应商清单为准（试算机可能本月有核算天但应计费为 0）。仅处理本列已有非空值的行。"""
+        规则：若计费开始日晚于本期计费截至 → 0（未到收钱日）。
+        若（本期计费开始 − 计费开始）> 30 天 → 按整段本期窗口：截至 − 本期开始（含首尾）。
+        否则 → 从 max(计费开始, 本期计费开始) 计至本期截至（含首尾）。
+        """
         if len(self.data_manager.data) == 0:
             if show_message:
                 messagebox.showinfo("提示", "当前没有数据")
             return
-        
+
         if BILLING_DAYS_COLUMN not in self.data_manager.data.columns:
             if show_message:
                 messagebox.showinfo("提示", f"当前表无「{BILLING_DAYS_COLUMN}」列")
@@ -1181,21 +1239,30 @@ class DatabaseAssetGUI:
 
         count = 0
         for index, row in self.data_manager.data.iterrows():
-            raw = row.get(BILLING_DAYS_COLUMN)
-            s = "" if raw is None else str(raw).strip()
-            if not s:
-                continue
-            v = self._parse_nonneg_days_int(s)
+            A = self._parse_datetime_cell(row.get("计费开始时间"))
+            S = self._parse_datetime_cell(row.get("本期计费开始时间"))
+            E = self._parse_datetime_cell(row.get("本期计费截至日期"))
+            pe_raw = str(row.get("本期计费截至日期", "")).strip()
+
+            v = 0
+            if A and S and E and pe_raw != "!":
+                Ad, Sd, Ed = A.date(), S.date(), E.date()
+                if Ad <= Ed:
+                    if (Sd - Ad).days > 30:
+                        v = self._inclusive_days(Sd, Ed)
+                    else:
+                        v = self._inclusive_days(max(Ad, Sd), Ed)
+
             self.data_manager.data.loc[index, BILLING_DAYS_COLUMN] = str(v)
             count += 1
-        
+
         if persist:
             self.data_manager.save_data()
             self.refresh_table()
         if show_message:
             messagebox.showinfo(
                 "成功",
-                f"已对 {count} 条含值的记录规范化「{BILLING_DAYS_COLUMN}」（未按本月核算天数覆盖）。",
+                f"已推算并写回 {count} 条记录的「{BILLING_DAYS_COLUMN}」。",
             )
 
     def _effective_days_for_total_cost(self, row) -> int:
@@ -1284,29 +1351,26 @@ class DatabaseAssetGUI:
             messagebox.showinfo("成功", "已按顺序完成全部计费相关计算并保存。")
 
     def calculate_month_days(self, show_message=True, persist=True):
-        """本月核算天数：用于「本月核算金额」＝数量×单价×本列（账单月用满约应收）；优先表内已填，空或无效时按日期推算。
+        """本月核算天数：本期计费截至 − 本期计费开始（含首尾）。
 
-        推算规则：2026 年 4 月与开通～有效止期交集（含首尾日）；止期取 min(月末,关停前一日若关停在本月,本期计费截至)。
-        试算机等场景下本列可与「应计费天数」不同：后者用于「合计费用」实收。"""
+        若两列暂无法解析，回退为「账单月 ∩ 开通～止期」交集（与旧逻辑一致，止期含关停前一日）。
+        """
         if len(self.data_manager.data) == 0:
             if show_message:
                 messagebox.showinfo("提示", "当前没有数据")
             return
-        
-        april_1 = datetime(2026, 4, 1).date()
-        april_30 = datetime(2026, 4, 30).date()
-        
+
+        month_start, month_end = self._bill_month_bounds()
+
         count = 0
         for index, row in self.data_manager.data.iterrows():
-            raw_days = row.get("本月核算天数")
-            month_days = None
-            if raw_days is not None and str(raw_days).strip() != "":
-                try:
-                    v = int(float(str(raw_days).replace(",", "").strip()))
-                    if v >= 0:
-                        month_days = v
-                except (ValueError, TypeError):
-                    month_days = None
+            month_days: int | None = None
+            ps = self._parse_datetime_cell(row.get("本期计费开始时间"))
+            pe = self._parse_datetime_cell(row.get("本期计费截至日期"))
+            pe_raw = str(row.get("本期计费截至日期", "")).strip()
+
+            if ps and pe and pe_raw != "!":
+                month_days = self._inclusive_days(ps.date(), pe.date())
 
             if month_days is None:
                 open_d = self._parse_billing_date(row.get("开通时间"))
@@ -1315,23 +1379,27 @@ class DatabaseAssetGUI:
 
                 month_days = 0
                 if open_d:
-                    ends = [april_30]
+                    ends = [month_end]
                     if shut_d:
-                        if april_1 <= shut_d <= april_30:
+                        if month_start <= shut_d <= month_end:
                             ends.append(shut_d - timedelta(days=1))
                         else:
                             ends.append(shut_d)
-                    if bill_until:
+                    if bill_until and pe_raw != "!":
                         ends.append(bill_until)
-                    last_in_april = min(ends)
-                    period_start = max(april_1, open_d)
-                    period_end = last_in_april
-                    if period_end >= april_1 and period_start <= april_30 and period_start <= period_end:
+                    last_in_month = min(ends)
+                    period_start = max(month_start, open_d)
+                    period_end = last_in_month
+                    if (
+                        period_end >= month_start
+                        and period_start <= month_end
+                        and period_start <= period_end
+                    ):
                         month_days = (period_end - period_start).days + 1
 
-            self.data_manager.data.loc[index, "本月核算天数"] = int(month_days)
+            self.data_manager.data.loc[index, "本月核算天数"] = int(month_days or 0)
             count += 1
-        
+
         if persist:
             self.data_manager.save_data()
             self.refresh_table()
@@ -1798,6 +1866,11 @@ class DatabaseAssetGUI:
         )
         if not path:
             return
+
+        bm = self.parse_bill_month_from_filename(os.path.basename(path))
+        if bm:
+            self.var_bill_year.set(bm[0])
+            self.var_bill_month.set(bm[1])
 
         try:
             summaries = []

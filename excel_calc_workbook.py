@@ -3,7 +3,7 @@
 在原供应商 Excel 上生成「计算版」：
 
 1. 完整复制工作簿；
-2. 明细行：与资产管理表按「目录+类型+名称+开通/关停+数量+单价」匹配，写回核算/应计费/合计等列；
+2. 明细行：与资产管理表按「目录+类型+名称+开通/关停+数量+单价」匹配，写回开通/关停、计费起止、核算天/使用天、应计费天、金额与合计等列（表头须含对应列名或别名）；
 3. 「本月合计费用」汇总区：按每 Sheet 公式后的明细（与界面「各 Sheet」一致）按「服务目录编号+服务名称」聚合，
    将合计费用、本月核算金额、数量、服务类型写回汇总表（表头无「开通时间」、有「合计费用」），并写「总计金额」行；
 4. 工作簿第一张表上的总览/总账统计表：优先按「资产管理」全量表（生成计算版时传入的 detail_df，与 数据库资产.csv / 程序计算明细 同源）
@@ -31,6 +31,8 @@ from data_manager import (
 from sheet_normalize import (
     SheetMatchRecord,
     _VENDOR_BILL_DAYS_HEADER_RE,
+    _VENDOR_REQUISITION_DAYS_HEADER_RE,
+    _VENDOR_USE_DAYS_HEADER_RE,
     _normalize_directory_id_token,
     _row_as_list,
     _strip_cell,
@@ -49,11 +51,25 @@ DEFAULT_DETAIL_SHEET = "程序计算明细"
 
 _WRITE_HEADER_ALIASES: Dict[str, Tuple[str, ...]] = {
     "本月核算天数": ("本月核算天数",),
+    "使用天数": ("使用天数",),
     "本月核算金额": ("本月核算金额",),
     BILLING_DAYS_COLUMN: (BILLING_DAYS_COLUMN, "截至2026年4月30日应计费天数"),
     "合计费用": ("合计费用", "本期合计费用"),
     "数量": ("数量",),
     "服务类型": ("服务类型",),
+    "开通时间": ("开通时间", "开通日期"),
+    "关停时间": ("关停时间",),
+    "计费开始时间": ("计费开始时间",),
+    "本期计费开始时间": (
+        "本期计费开始时间",
+        "本期计费开始日期",
+    ),
+    "本期计费截至日期": (
+        "本期计费截至日期",
+        "本期计费截止日期",
+        "本期计费结束日期",
+        "计费截至日期",
+    ),
 }
 
 
@@ -167,7 +183,25 @@ def _header_col_j0(header_idx: Dict[str, int], logical: str) -> Optional[int]:
         for k, j in header_idx.items():
             if _VENDOR_BILL_DAYS_HEADER_RE.fullmatch(k):
                 return j
+    if logical == "使用天数":
+        for k, j in header_idx.items():
+            if _VENDOR_USE_DAYS_HEADER_RE.fullmatch(k):
+                return j
+        for k, j in header_idx.items():
+            if _VENDOR_REQUISITION_DAYS_HEADER_RE.fullmatch(k):
+                return j
     return None
+
+
+_DATE_WRITEBACK_LOGICALS = frozenset(
+    {
+        "开通时间",
+        "关停时间",
+        "计费开始时间",
+        "本期计费开始时间",
+        "本期计费截至日期",
+    }
+)
 
 
 def _excel_cell_value(logical: str, raw: Any) -> Any:
@@ -176,9 +210,18 @@ def _excel_cell_value(logical: str, raw: Any) -> Any:
     if isinstance(raw, float) and pd.isna(raw):
         return None
     st = str(raw).strip()
+    if logical in _DATE_WRITEBACK_LOGICALS:
+        return st if st else None
     if logical in ("本月核算天数", BILLING_DAYS_COLUMN):
         if not st:
             return 0
+        try:
+            return max(0, int(float(st.replace(",", ""))))
+        except ValueError:
+            return st
+    if logical == "使用天数":
+        if not st:
+            return None
         try:
             return max(0, int(float(st.replace(",", ""))))
         except ValueError:
@@ -195,6 +238,30 @@ def _excel_cell_value(logical: str, raw: Any) -> Any:
         return float(s2)
     except ValueError:
         return st
+
+
+def _first_nonneg_int_from_row(row: pd.Series, cols: Tuple[str, ...]) -> Optional[int]:
+    for col in cols:
+        if col not in row.index:
+            continue
+        raw = row.get(col)
+        if raw is None or (isinstance(raw, float) and pd.isna(raw)):
+            continue
+        st = str(raw).strip()
+        if not st or st.lower() in ("nan", "none", "nat"):
+            continue
+        try:
+            return max(0, int(float(st.replace(",", "").replace("，", ""))))
+        except ValueError:
+            continue
+    return None
+
+
+def _usage_days_writeback_value(row: pd.Series) -> Optional[int]:
+    """写回供应商「截至…使用天数」列：使用天 → 应计费天 → 本月核算天（与合计费用取天顺序一致）。"""
+    return _first_nonneg_int_from_row(
+        row, ("使用天数", BILLING_DAYS_COLUMN, "本月核算天数")
+    )
 
 
 def _write_money_cell(ws, row_1based: int, col_1based: int, val: Any) -> None:
@@ -545,13 +612,27 @@ def _fill_detail_lines(
                 unmatched += 1
                 continue
             matched_rows += 1
-            for logical in ("本月核算天数", "本月核算金额", BILLING_DAYS_COLUMN, "合计费用"):
+            for logical in (
+                "开通时间",
+                "关停时间",
+                "计费开始时间",
+                "本期计费开始时间",
+                "本期计费截至日期",
+                "本月核算天数",
+                "使用天数",
+                "本月核算金额",
+                BILLING_DAYS_COLUMN,
+                "合计费用",
+            ):
                 j0 = _header_col_j0(rec.header_idx, logical)
                 if j0 is None:
                     continue
                 if logical not in row.index:
                     continue
-                val = _excel_cell_value(logical, row.get(logical))
+                if logical == "使用天数":
+                    val = _usage_days_writeback_value(row)
+                else:
+                    val = _excel_cell_value(logical, row.get(logical))
                 if val is None:
                     continue
                 try:
